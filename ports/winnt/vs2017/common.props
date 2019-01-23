@@ -18,7 +18,7 @@
     </BuildLog>
     <ClCompile>
       <AdditionalIncludeDirectories>$(VC_IncludePath);..\..\include;..\..\..\..\lib\isc\win32\include;..\..\..\..\include;..\..\..\..\lib\isc\include;..\..\..\..\sntp\libopts;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_CONSOLE;_WINDOWS;WIN32;SYS_WINNT;HAVE_CONFIG_H;HAVE_ARC4RANDOM_BUF;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CONSOLE;_WINDOWS;WIN32;SYS_WINNT;HAVE_CONFIG_H;HAVE_ARC4RANDOM_BUF;_CRT_SECURE_NO_WARNINGS;CLOCK_SHM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <ExceptionHandling />
       <FunctionLevelLinking>true</FunctionLevelLinking>
