@@ -364,9 +364,9 @@ getShmTime(
 	 * permission at all and could be grabbed by anyone, including setting permissions. This is 
 	 * not ideal, to say the least, and could even be a security issue. This revision creates 
 	 * the segment with the default permissions in any case, and adds additional read and write 
-	 * permissions for all logged users if the forall flag is set. In both cases the environment
-	 * variable NTP_SHM_PERMISSIONS is read as a semicolon-separated list of SIDs, and if any
-	 * valid SID is found it is added with a r/w permission to the ACL.
+	 * permissions for all logged users if the forall flag is set. In both cases the registry
+	 * key HKLM\SOFTWARE\NTP\ShmPermissions is read as a semicolon-separated list of SIDs, and 
+	 * if any valid SID is found it is added with a r/w permission to the ACL.
 	 */
 
 	fullSecurityDescriptor = shm_getFullSecurityDescriptor(forall);
