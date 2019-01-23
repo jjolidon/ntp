@@ -36,6 +36,11 @@
 # include <assert.h>
 # include <unistd.h>
 # include <stdio.h>
+#else
+#include "sddl.h"
+#include "winnt.h"
+#include "tchar.h"
+#include "string.h"
 #endif
 
 #ifdef HAVE_STDATOMIC_H
@@ -70,6 +75,9 @@ static  void    shm_timer       (int unit, struct peer *peer);
 static	void	shm_clockstats  (int unit, struct peer *peer);
 static	void	shm_control	(int unit, const struct refclockstat * in_st,
 				 struct refclockstat * out_st, struct peer *peer);
+static void		shm_readPermissionsFromRegistry (struct sidListItem **permissions, 
+				 int *validSidsCount, int *totalSidLength);
+static char *	shm_getFullSecurityDescriptor (BOOL forall);
 
 /*
  * Transfer vector
@@ -122,6 +130,183 @@ struct shmunit {
 	time_t max_delay;	/* age/stale limit */
 };
 
+#ifdef SYS_WINNT
+struct sidListItem {
+	char *sid;
+	int sidLength;
+	struct sidListItem *next;
+};
+
+static void
+shm_readPermissionsFromRegistry(struct sidListItem **permissions, int *validSidsCount, int *totalSidLength)
+{
+	*permissions = NULL;
+	*validSidsCount = 0;
+	*totalSidLength = 0;
+
+	HKEY permissionsKey;
+	LSTATUS result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\NTP"), 0, KEY_READ, (PHKEY)&permissionsKey);
+	if(result != ERROR_SUCCESS)	{
+		msyslog(LOG_INFO,"SHM RegOpenKeyEx (HKLM\\SOFTWARE\\NTP) failed (but this could be normal): %m");
+		return;
+	}
+
+	DWORD shmPermissionLengthBytes = 0;
+	DWORD regValueType = 0;
+	result = RegQueryValueEx(permissionsKey, TEXT("ShmPermissions"), NULL, &regValueType, NULL, (LPDWORD)&shmPermissionLengthBytes);
+	if(result != ERROR_SUCCESS)	{
+		msyslog(LOG_INFO,"SHM RegQueryValueEx (HKLM\\SOFTWARE\\NTP\\ShmPermissions) failed (but this could be normal): %m");
+		RegCloseKey(permissionsKey);
+		return;
+	}
+
+	if(shmPermissionLengthBytes == 0) {
+		msyslog(LOG_INFO,"SHM RegQueryValueEx HKLM\\SOFTWARE\\NTP\\ShmPermissions has length 0.");
+		RegCloseKey(permissionsKey);
+		return;
+	}
+
+	if(regValueType != REG_SZ) {
+		msyslog(LOG_INFO,"SHM RegQueryValueEx HKLM\\SOFTWARE\\NTP\\ShmPermissions is not of the expected type (expecting REG_SZ).");
+		RegCloseKey(permissionsKey);
+		return;
+	}
+	
+	/* The string retrieved from the registry may or may not contain a null terminator, we need to add one. Worst case we have two. */
+	TCHAR *shmPermissions = (TCHAR*)emalloc_zero(shmPermissionLengthBytes + sizeof(TCHAR));
+	TCHAR *parsingBuffer;
+	int numberOfCharsInToken = 0;
+	struct sidListItem *last = NULL;
+	TCHAR *currentPos = shmPermissions;
+	SID *parsedSid;
+	struct sidListItem *newSid;
+
+	result = RegQueryValueEx(permissionsKey, TEXT("ShmPermissions"), NULL, NULL, (LPBYTE)shmPermissions, (LPDWORD)&shmPermissionLengthBytes);
+	if(result != ERROR_SUCCESS || shmPermissionLengthBytes == 0) {
+		msyslog(LOG_ERR,"SHM RegQueryValueEx HKLM\\SOFTWARE\\NTP\\ShmPermissions failed: %m");
+		free(shmPermissions);
+		RegCloseKey(permissionsKey);
+		return;
+	}
+
+	/* currentPos is at most shmPermissionLengthBytes + 1, we need a buffer of the same size*/
+	parsingBuffer = (TCHAR*)emalloc_zero(shmPermissionLengthBytes + sizeof(TCHAR));
+	TCHAR *endOfBuffer = parsingBuffer + shmPermissionLengthBytes + sizeof(TCHAR);
+	while(currentPos < endOfBuffer) {
+		numberOfCharsInToken = 0;
+		int assignedFields = _stscanf_s(currentPos, TEXT("%[^;]%n"), parsingBuffer, (unsigned int)(shmPermissionLengthBytes/sizeof(TCHAR)), &numberOfCharsInToken);
+		if(assignedFields == 1)
+		{
+			if(!ConvertStringSidToSid(parsingBuffer, &parsedSid)) {
+				msyslog(LOG_WARNING, "SHM NTP Shared Memory permissions (HKLM\\SOFTWARE\\NTP\\ShmPermissions) contains an invalid SID: %s", parsingBuffer);
+			} else {
+				*totalSidLength += numberOfCharsInToken;
+				*validSidsCount += 1;
+				newSid = (struct sidListItem*)emalloc_zero(sizeof(struct sidListItem));
+				newSid->sid = (TCHAR*)emalloc_zero((numberOfCharsInToken + 1) * sizeof(TCHAR));
+				memcpy_s(newSid->sid, (numberOfCharsInToken + 1) * sizeof(TCHAR), parsingBuffer, (numberOfCharsInToken + 1) * sizeof(TCHAR));
+				newSid->sidLength = numberOfCharsInToken;
+				if(*permissions == NULL) {
+					*permissions = newSid;
+					last = newSid;
+				} else {
+					last->next = newSid;
+					last = newSid;
+				}
+
+				/* We don't actually need the SID, just its string representation. */
+				LocalFree(parsedSid);
+			}
+		}
+
+		/* Advance at the end of token */
+		currentPos += numberOfCharsInToken;
+		if(*currentPos != ';')
+		{
+			break;
+		}
+		++currentPos;
+	}
+
+	free(parsingBuffer);
+	free(shmPermissions);
+	RegCloseKey(permissionsKey);
+}
+
+static TCHAR *
+shm_getFullSecurityDescriptor(BOOL forall)
+{
+	/* Read the permissions from the environment variable */
+	struct sidListItem *initial = NULL;
+	int totalSidLength = 0;
+	int validSidsCount = 0;
+	struct sidListItem *current;
+	struct sidListItem *previous;
+	TCHAR *descriptorBase;
+	TCHAR *allowAllACE;
+	int descriptorBaseLen;
+	int allowAllACELen;
+	int aceBaseLen;
+	int descriptorFullLen;
+
+	shm_readPermissionsFromRegistry(&initial, &validSidsCount, &totalSidLength);
+
+	/* SY: System has all rights; BA: Admins have all rights */
+	descriptorBase = TEXT("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)");
+	descriptorBaseLen = strlen(descriptorBase);
+	/* AU: authenticated users can r/w */
+	allowAllACE = TEXT("(A;OICI;GWGR;;;AU)");
+	allowAllACELen = strlen(allowAllACE);
+	/* Any SID provided in the environment variable has read and write. */
+	aceBaseLen = strlen(TEXT("(A;OICI;GWGR;;;)"));
+
+	descriptorFullLen = descriptorBaseLen + totalSidLength + (validSidsCount * aceBaseLen);
+	if(forall) {
+		descriptorFullLen += allowAllACELen;
+	}
+
+	int remainingMem = (descriptorFullLen + 1) * sizeof(TCHAR);
+	int remainingChars = descriptorFullLen;
+	TCHAR * fullSecurityDescriptor = (TCHAR*)emalloc_zero(remainingMem);
+	TCHAR * currentPos = fullSecurityDescriptor;
+
+	/* Copy the base descriptor */
+	memcpy_s(currentPos, remainingMem, descriptorBase, descriptorBaseLen * sizeof(TCHAR));
+	currentPos += descriptorBaseLen * sizeof(TCHAR);
+	remainingMem -= descriptorBaseLen * sizeof(TCHAR);
+	remainingChars -= descriptorBaseLen;
+
+	if(forall) {
+		/* If everyone is allowed, copy the additional ACE for that */
+		memcpy_s(currentPos, remainingMem, allowAllACE, allowAllACELen * sizeof(TCHAR));
+		currentPos += allowAllACELen * sizeof(TCHAR);
+		remainingMem -= allowAllACELen * sizeof(TCHAR);
+		remainingChars -= allowAllACELen;
+	}
+	
+	/* Create an ACE for any sid provided in the environment variable */
+	if(initial != NULL && totalSidLength != 0)
+	{
+		current = initial;
+		while(current != NULL)
+		{
+			_sntprintf_s(currentPos, remainingMem, remainingChars, TEXT("(A;OICI;GWGR;;;%s)"), current->sid);
+			currentPos += (current->sidLength + aceBaseLen) * sizeof(TCHAR);
+			remainingMem -= (current->sidLength + aceBaseLen) * sizeof(TCHAR);
+			remainingChars -= (current->sidLength + aceBaseLen);
+			previous = current;
+			current = current->next;
+			free(previous->sid);
+			free(previous);
+			previous = NULL;
+		}
+		/* We've cleared the list */
+		initial = NULL;
+	}
+
+	return fullSecurityDescriptor;
+}
+#endif
 
 static struct shmTime*
 getShmTime(
@@ -158,31 +343,43 @@ getShmTime(
 	char buf[20];
 	LPSECURITY_ATTRIBUTES psec = 0;
 	HANDLE shmid = 0;
-	SECURITY_DESCRIPTOR sd;
 	SECURITY_ATTRIBUTES sa;
 	unsigned int numch;
-
+	char *fullSecurityDescriptor = NULL;
+	
 	numch = snprintf(buf, sizeof(buf), "%s\\NTP%d",
 			 nspref[forall != 0], (unit & 0xFF));
 	if (numch >= sizeof(buf)) {
 		msyslog(LOG_ERR, "SHM name too long (unit %d)", unit);
 		return NULL;
 	}
-	if (forall) { /* world access */
-		if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
-			msyslog(LOG_ERR,"SHM InitializeSecurityDescriptor (unit %d): %m", unit);
+
+	ZeroMemory(&sa, sizeof(sa));
+	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+	sa.bInheritHandle = FALSE;
+	psec = &sa;
+
+	/* We used to create the shm segment with no permission if the forall flag was not set.
+	 * As of Windows 10 (and surely before) this has the consequence that the segment has no 
+	 * permission at all and could be grabbed by anyone, including setting permissions. This is 
+	 * not ideal, to say the least, and could even be a security issue. This revision creates 
+	 * the segment with the default permissions in any case, and adds additional read and write 
+	 * permissions for all logged users if the forall flag is set. In both cases the environment
+	 * variable NTP_SHM_PERMISSIONS is read as a semicolon-separated list of SIDs, and if any
+	 * valid SID is found it is added with a r/w permission to the ACL.
+	 */
+
+	fullSecurityDescriptor = shm_getFullSecurityDescriptor(forall);
+	
+	/* Initialize the security descriptor. */
+	if(!ConvertStringSecurityDescriptorToSecurityDescriptor(fullSecurityDescriptor, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
+			msyslog(LOG_ERR,"SHM ConvertStringSecurityDescriptorToSecurityDescriptor (unit %d): %m", unit);
 			return NULL;
-		}
-		if (!SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
-			msyslog(LOG_ERR, "SHM SetSecurityDescriptorDacl (unit %d): %m", unit);
-			return NULL;
-		}
-		sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-		sa.lpSecurityDescriptor = &sd;
-		sa.bInheritHandle = FALSE;
-		psec = &sa;
 	}
-	shmid = CreateFileMapping ((HANDLE)0xffffffff, psec, PAGE_READWRITE,
+
+	free(fullSecurityDescriptor);
+
+	shmid = CreateFileMapping (INVALID_HANDLE_VALUE, psec, PAGE_READWRITE,
 				   0, sizeof (struct shmTime), buf);
 	if (shmid == NULL) { /*error*/
 		char buf[1000];		
@@ -658,7 +855,6 @@ static void shm_clockstats(
 	}
 	up->ticks = up->good = up->notready = up->bad = up->clash = 0;
 }
-
 #else
 NONEMPTY_TRANSLATION_UNIT
 #endif /* REFCLOCK */
